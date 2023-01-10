@@ -1,0 +1,175 @@
+#!/bin/sh
+
+set -e
+
+SBMAN_CONFIG="${SBMAN_CONFIG-/etc/secureboot}"
+OLDKEYS="${SBMAN_CONFIG}/original_keys"
+KEYS="${SBMAN_CONFIG}/keys"
+
+if [ -r "${SBMAN_CONFIG}/config" ] ; then
+	. "${SBMAN_CONFIG}/config"
+fi
+
+if ! [ "$(systemctl show --property=LoadState boot-efi.automount)" = "LoadState=loaded" ] ; then
+	echo >&2 "ERROR: sbman requires /boot/efi to be configured by systemd.automount"
+	exit 1
+fi
+
+setup() {
+	if ! [ -d "${SBMAN_CONFIG}" ] ; then
+		mkdir -m 0700 "${SBMAN_CONFIG}"
+	fi
+	if ! [ -e "${SBMAN_CONFIG}/cmdline" ] ; then
+		sed 's/^BOOT_IMAGE=[^ ]\+ //' /proc/cmdline > "${SBMAN_CONFIG}/cmdline"
+	fi
+	generate_keys
+	install_keys
+	install_loader
+	prepare_kernel $(uname -r)
+}
+
+generate_keys() {
+	if ! [ -d "${SBMAN_CONFIG}" ] ; then
+		mkdir -m 0700 "${SBMAN_CONFIG}"
+	fi
+	# Never overwrite keys...
+	if [ -d "${KEYS}" ] ; then
+		echo >&2 "ERROR: ${KEYS} already exists and may have existing keys!"
+		exit 1
+	fi
+	if [ -d "${OLDKEYS}" ] ; then
+		echo >&2 "ERROR: ${OLDKEYS} already exists and may have existing keys!"
+		exit 1
+	fi
+
+	# Create & lock down directories
+	mkdir -m 0700 "${KEYS}" "${OLDKEYS}"
+	cd "${KEYS}"
+
+	# Save existing keys from EFI
+	efi-readvar -v PK -o "${OLDKEYS}/PK.esl"
+	efi-readvar -v KEK -o "${OLDKEYS}/KEK.esl"
+	efi-readvar -v db -o "${OLDKEYS}/db.esl"
+	efi-readvar -v dbx -o "${OLDKEYS}/dbx.esl"
+
+	# Create each of our keys
+	openssl req -new -x509 -newkey rsa:2048 -subj "/CN=$(hostname) platform key/" \
+		-keyout PK.key -out PK.crt -days 3650 -nodes -sha256
+	openssl req -new -x509 -newkey rsa:2048 -subj "/CN=$(hostname) key-exchange key/" \
+		-keyout KEK.key -out KEK.crt -days 3650 -nodes -sha256
+	openssl req -new -x509 -newkey rsa:2048 -subj "/CN=$(hostname) kernel-signing key/" \
+		-keyout db.key -out db.crt -days 3650 -nodes -sha256
+	chmod 400 *.key
+
+	# Create keystore update files from our keys
+	cert-to-efi-sig-list -g $(openssl rand -base64 40) PK.crt PK.esl
+	sign-efi-sig-list -k PK.key -c PK.crt PK PK.esl PK.auth
+	cert-to-efi-sig-list -g $(openssl rand -base64 40) KEK.crt KEK.esl
+	sign-efi-sig-list -a -k PK.key -c PK.crt KEK KEK.esl KEK.auth
+	cert-to-efi-sig-list -g $(openssl rand -base64 40) db.crt db.esl
+	sign-efi-sig-list -a -k KEK.key -c KEK.crt db db.esl db.auth
+	cp "${OLDKEYS}/dbx.esl" dbx.esl
+	sign-efi-sig-list -k KEK.key -c KEK.crt dbx dbx.esl dbx.auth
+
+	# Create DER versions of our certificates
+	openssl x509 -outform DER -in PK.crt -out PK.cer
+	openssl x509 -outform DER -in KEK.crt -out KEK.cer
+	openssl x509 -outform DER -in db.crt -out db.cer
+
+	cd - >/dev/null
+}
+
+install_keys() {
+	if [ $(stat -c %s "${KEYS}/dbx.esl") -gt 0 ] ; then
+		efi-updatevar -e -f "${KEYS}/dbx.esl" dbx
+	fi
+	efi-updatevar -e -f "${KEYS}/db.esl" db
+	efi-updatevar -e -f "${KEYS}/KEK.esl" KEK
+	efi-updatevar -f "${KEYS}/PK.auth" PK
+}
+
+_sbsign() {
+	sbsign --key "${SBMAN_CONFIG}/keys/db.key" --cert "${SBMAN_CONFIG}/keys/db.crt" "$@"
+}
+
+_kmodsign() {
+	kmodsign sha512 "${SBMAN_CONFIG}/keys/db.key" "${SBMAN_CONFIG}/keys/db.cer" "$@"
+}
+
+install_loader() {
+	TMPESP=$(mktemp -d)
+	mkdir $TMPESP/mount
+	truncate -s 1M $TMPESP/img
+	mkfs.vfat $TMPESP/img
+	mount -o loop $TMPESP/img $TMPESP/mount
+	SYSTEMD_RELAX_ESP_CHECKS=1 bootctl --path="${TMPESP}/mount" install --no-variables
+	_sbsign "${TMPESP}/mount/EFI/systemd/systemd-bootx64.efi"
+	mv -f "${TMPESP}/mount/EFI/systemd/systemd-bootx64.efi.signed" "${TMPESP}/mount/EFI/systemd/systemd-bootx64.efi"
+	_sbsign "${TMPESP}/mount/EFI/BOOT/BOOTX64.EFI"
+	mv -f "${TMPESP}/mount/EFI/BOOT/BOOTX64.EFI.signed" "${TMPESP}/mount/EFI/BOOT/BOOTX64.EFI"
+	rsync -a "${TMPESP}/mount/EFI/" /boot/efi/
+	umount $TMPESP/mount
+	rm -rf $TMPESP
+}
+
+update_esps() {
+	primary_esp="$(systemctl show boot-efi.mount --property=What | sed 's/^What=//')"
+	src="$(mktemp -d)"
+	mount "$primary_esp" "$src"
+	lsblk -e 7 -lnpo NAME,PARTTYPE |\
+		awk '/c12a7328-f81f-11d2-ba4b-00a0c93ec93b/ {print $1}' |\
+		grep -v "^$(readlink -e "$primary_esp")" |\
+		while read REAL_ESP ; do
+			mount="$(mktemp -d)"
+			mount "${REAL_ESP}" "${mount}"
+			rsync -ac --modify-window=1 --delete "$src/" "${mount}/" "$@"
+			umount "${mount}"
+			rmdir "${mount}"
+		done
+	umount "$src"
+	rmdir "$src"
+}
+
+prepare_kernel() {
+	local VERSION="${1}"
+
+	# Ensure kernel, initramfs, and cmdline currently exist
+	test -f "/boot/vmlinuz-${VERSION}"
+	test -f "/boot/initrd.img-${VERSION}"
+	test -f "${SBMAN_CONFIG}/cmdline"
+
+	# Build EFI monolith in a temp file
+	local UNSIGNED="$(mktemp)"
+	trap "rm -f ${UNSIGNED}" EXIT
+
+	# Create the unsigned kernel bundle
+	objcopy \
+		--add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
+		--add-section .cmdline="${SBMAN_CONFIG}/cmdline" --change-section-vma .cmdline=0x30000 \
+		--add-section .linux="/boot/vmlinuz-${VERSION}" --change-section-vma .linux=0x40000 \
+		--add-section .initrd="/boot/initrd.img-${VERSION}" --change-section-vma .initrd=0x3000000 \
+		/usr/lib/systemd/boot/efi/linuxx64.efi.stub $UNSIGNED
+
+	# Sign and install the kernel bundle
+	_sbsign --output "/boot/efi/EFI/Linux/vmlinuz-${VERSION}.efi" $UNSIGNED
+	rm -f $UNSIGNED
+}
+
+sbman_update_initramfs() {
+	local VERSION="${1}"
+	local INITRD="${2}"
+	prepare_kernel "${VERSION}"
+}
+
+sbman_kernel_postrm() {
+	local VERSION="${1}"
+	rm -f "/boot/efi/EFI/Linux/vmlinuz-${VERSION}.efi"
+}
+
+cmd="$(basename "${0}")"
+if [ "${cmd}" = "sbman" ] ; then
+	cmd="${1}"
+	shift
+fi
+
+"$cmd" "$@"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Launch timer to update other ESPs
+BindsTo=boot-efi.mount
+After=boot-efi.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStop=/usr/bin/systemd-run --no-block --on-active=5s --unit update-esps.service /usr/local/sbin/sbman update_esps -i
+
+[Install]
+WantedBy=boot-efi.mount

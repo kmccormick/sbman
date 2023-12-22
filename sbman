@@ -12,7 +12,8 @@ fi
 
 if ! [ "$(systemctl show --property=LoadState boot-efi.automount)" = "LoadState=loaded" ] ; then
 	echo >&2 "ERROR: sbman requires /boot/efi to be configured by systemd.automount"
-	exit 1
+	# if running inside a chroot (e.g. installing) assume the user knows what they're doing and continue
+	ischroot || exit 1
 fi
 
 setup() {
